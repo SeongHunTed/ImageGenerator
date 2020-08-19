@@ -59,9 +59,11 @@ class WB_Cartoonize:
         if gpu:
             gpu_options = tf.GPUOptions(allow_growth=True)
             device_count = {'GPU':1}
+            print('gpu')
         else:
             gpu_options = None
             device_count = {'GPU':0}
+            print('cpu')
         
         config = tf.ConfigProto(gpu_options=gpu_options, device_count=device_count)
         

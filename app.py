@@ -1,42 +1,41 @@
 import os
 import io
 import uuid
+import shutil
 import sys
 import yaml
 import traceback
+
+import threading
+import time
+from queue import Empty, Queue
+
+import cv2
+from flask import Flask, render_template, make_response, flash, send_file, request, jsonify
+import flask
+from PIL import Image
+import numpy as np
 
 with open('./config.yaml', 'r') as fd:
     opts = yaml.safe_load(fd)
 
 sys.path.insert(0, './white_box_cartoonizer/')
 
-import cv2
-from flask import Flask, render_template, make_response, flash
-import flask
-from PIL import Image
-import numpy as np
-
 from cartoonize import WB_Cartoonize
 
-if not opts['run_local']:
-    if 'GOOGLE_APPLICATION_CREDENTIALS' in os.environ:
-        from gcloud_utils import upload_blob, generate_signed_url, delete_blob
-    else:
-        raise Exception("GOOGLE_APPLICATION_CREDENTIALS not set in environment variables")
-    from video_api import api_request
-    # Algorithmia (GPU inference)
-    import Algorithmia
-
+###################################################################
 app = Flask(__name__)
 
-app.config['UPLOAD_FOLDER_VIDEOS'] = 'static/uploaded_videos'
-app.config['CARTOONIZED_FOLDER'] = 'static/cartoonized_images'
-
+DATA_FOLDER = 'data'
 app.config['OPTS'] = opts
 
 ## Init Cartoonizer and load its weights 
 wb_cartoonizer = WB_Cartoonize(os.path.abspath("white_box_cartoonizer/saved_models/"), opts['gpu'])
 
+requests_queue = Queue()
+BATCH_SIZE=1
+CHECK_INTERVAL=0.1
+##################################################################
 def convert_bytes_to_image(img_bytes):
     """Convert bytes to numpy array
 
@@ -58,76 +57,127 @@ def convert_bytes_to_image(img_bytes):
     
     return image
 
+def run(input_file, file_type, f_path):
+
+    if file_type == 'image':
+        f_name = str(uuid.uuid4())
+
+        img = input_file.read()
+
+        ## Read Image and convert to PIL (RGB) if RGBA convert appropriately
+        image = convert_bytes_to_image(img)
+
+        cartoon_image = wb_cartoonizer.infer(image)
+
+        cartoonized_img_name = os.path.join(f_path, f_name + ".jpg")
+        cv2.imwrite(cartoonized_img_name, cv2.cvtColor(cartoon_image, cv2.COLOR_RGB2BGR))
+
+        result_path = cartoonized_img_name
+
+        return result_path
+
+    if file_type == 'video':
+        f_name = input_file.filename
+
+        video = input_file
+
+        original_video_path = os.path.join(f_path, f_name)
+        video.save(original_video_path)
+
+        # Slice, Resize and Convert Video to 15fps
+        modified_video_path = os.path.join(f_path, f_name.split(".")[0] + "_modified.mp4")
+        width_resize = 480
+        os.system(
+            "ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -t 10 -filter:v scale={}:-2 -r 15 -c:a copy '{}'".format(
+                os.path.abspath(original_video_path), width_resize, os.path.abspath(modified_video_path)))
+
+        # if local then "output_uri" is a file path
+        output_uri = wb_cartoonizer.process_video(modified_video_path)
+
+        result_path = output_uri
+
+        return result_path
+
+def handle_requests_by_batch():
+    try:
+        while True:
+            requests_batch = []
+
+            while not (
+              len(requests_batch) >= BATCH_SIZE # or
+              #(len(requests_batch) > 0 #and time.time() - requests_batch[0]['time'] > BATCH_TIMEOUT)
+            ):
+              try:
+                requests_batch.append(requests_queue.get(timeout=CHECK_INTERVAL))
+              except Empty:
+                continue
+
+            batch_outputs = []
+
+            for request in requests_batch:
+                batch_outputs.append(run(request['input'][0], request['input'][1], request['input'][2]))
+
+            for request, output in zip(requests_batch, batch_outputs):
+                request['output'] = output
+
+    except Exception as e:
+        while not requests_queue.empty():
+            requests_queue.get()
+        print(e)
+
+threading.Thread(target=handle_requests_by_batch).start()
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    try:
+        print(requests_queue.qsize())
+
+        if requests_queue.qsize() >= 1:
+            return jsonify({'message': 'Too Many Requests'}), 429
+
+        input_file = request.files['source']
+        file_type = request.form['file_type']
+
+        if file_type == 'image':
+            if input_file.content_type not in ['image/jpeg', 'image/jpg', 'image/png']:
+                return jsonify({'message': 'Only support jpeg, jpg or png'}), 400
+
+        else :
+            if input_file.content_type not in ['video/mp4']:
+                return jsonify({'message': 'Only support mp4'}), 400
+
+        f_id = str(uuid.uuid4())
+        f_path = os.path.join(DATA_FOLDER, f_id)
+        os.makedirs(f_path, exist_ok=True)
+
+        req = {
+            'input': [input_file, file_type, f_path]
+        }
+
+        requests_queue.put(req)
+
+        while 'output' not in req:
+            time.sleep(CHECK_INTERVAL)
+
+        result_path = req['output']
+
+        result = send_file(result_path)
+
+        shutil.rmtree(f_path)
+
+        return result
+
+    except Exception as e:
+        print(traceback.print_exc())
+        flash("Our server hiccuped :/ Please upload another file! :)")
+        return render_template("index.html")
+
+@app.route('/health')
+def health():
+    return "ok"
+
 @app.route('/')
-@app.route('/cartoonize', methods=["POST", "GET"])
-def cartoonize():
-    opts = app.config['OPTS']
-    if flask.request.method == 'POST':
-        try:
-            if flask.request.files.get('image'):
-                img = flask.request.files["image"].read()
-                
-                ## Read Image and convert to PIL (RGB) if RGBA convert appropriately
-                image = convert_bytes_to_image(img)
-
-                img_name = str(uuid.uuid4())
-                
-                cartoon_image = wb_cartoonizer.infer(image)
-                
-                cartoonized_img_name = os.path.join(app.config['CARTOONIZED_FOLDER'], img_name + ".jpg")
-                cv2.imwrite(cartoonized_img_name, cv2.cvtColor(cartoon_image, cv2.COLOR_RGB2BGR))
-                
-                if not opts["run_local"]:
-                    # Upload to bucket
-                    output_uri = upload_blob("cartoonized_images", cartoonized_img_name, img_name + ".jpg", content_type='image/jpg')
-
-                    # Delete locally stored cartoonized image
-                    os.system("rm " + cartoonized_img_name)
-                    cartoonized_img_name = generate_signed_url(output_uri)
-                    
-
-                return render_template("index_cartoonized.html", cartoonized_image=cartoonized_img_name)
-
-            if flask.request.files.get('video'):
-                
-                filename = str(uuid.uuid4()) + ".mp4"
-                video = flask.request.files["video"]
-                original_video_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename)
-                video.save(original_video_path)
-                
-                # Slice, Resize and Convert Video to 15fps
-                modified_video_path = os.path.join(app.config['UPLOAD_FOLDER_VIDEOS'], filename.split(".")[0] + "_modified.mp4")
-                width_resize=480
-                os.system("ffmpeg -hide_banner -loglevel warning -ss 0 -i '{}' -t 10 -filter:v scale={}:-2 -r 15 -c:a copy '{}'".format(os.path.abspath(original_video_path), width_resize, os.path.abspath(modified_video_path)))
-                
-                if opts["run_local"]:
-                    # if local then "output_uri" is a file path
-                    output_uri = wb_cartoonizer.process_video(modified_video_path)
-                else:
-                    data_uri = upload_blob("processed_videos_cartoonize", modified_video_path, filename, content_type='video/mp4', algo_unique_key='cartoonizeinput')
-                    response = api_request(data_uri)
-
-                    # Delete the processed video from Cloud storage
-                    delete_blob("processed_videos_cartoonize", filename)
-                    output_uri = response['output_uri']
-                
-                # Delete the videos from local disk
-                os.system("rm " + original_video_path) 
-                os.system("rm " + modified_video_path)
-                
-                if opts["run_local"]:
-                    signed_url = output_uri
-                else:
-                    signed_url = generate_signed_url(output_uri)
-
-                return render_template("index_cartoonized.html", cartoonized_video=signed_url)
-        
-        except Exception as e:
-            print(traceback.print_exc())
-            flash("Our server hiccuped :/ Please upload another file! :)")
-            return render_template("index_cartoonized.html")
-    else:
-        return render_template("index_cartoonized.html")
-
+def main():
+    return render_template('index.html')
 if __name__ == "__main__":
-    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 80)))
