@@ -1,4 +1,4 @@
-FROM nvidia/cuda:10.1-runtime-ubuntu18.04
+FROM nvidia/cuda:10.1-cudnn7-runtime-ubuntu18.04
 
 ENV GOOGLE_APPLICATION_CREDENTIALS "./token.json"
 
