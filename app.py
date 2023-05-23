@@ -25,6 +25,8 @@ from cartoonize import WB_Cartoonize
 
 ###################################################################
 app = Flask(__name__)
+app.secret_key = 'tjdgns12'
+app.config['SESSION_TYPE'] = 'filesystem'
 
 DATA_FOLDER = 'data'
 app.config['OPTS'] = opts
@@ -61,8 +63,11 @@ def run(input_file, file_type, f_path):
 
     if file_type == 'image':
         f_name = str(uuid.uuid4())
-
         img = input_file.read()
+
+        print("input_file : ", input_file)
+        print("file_type : ",file_type)
+        print("f_path : ", f_path)
 
         ## Read Image and convert to PIL (RGB) if RGBA convert appropriately
         image = convert_bytes_to_image(img)
